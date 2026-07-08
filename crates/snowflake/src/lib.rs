@@ -1,4 +1,5 @@
 mod arrow;
+mod auth;
 mod client;
 mod input;
 mod query;

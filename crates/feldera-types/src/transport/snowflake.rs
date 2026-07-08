@@ -35,6 +35,10 @@ pub enum SnowflakeTransactionMode {
     None,
 
     /// Ingest the snapshot in one Feldera transaction.
+    ///
+    /// If snapshot ingestion fails after records have been queued, the partial
+    /// transaction is committed because connector transactions do not support
+    /// rollback. Atomic rollback on failure is not currently supported.
     #[serde(rename = "snapshot")]
     Snapshot,
 }
@@ -80,11 +84,14 @@ pub struct SnowflakeReaderConfig {
     pub schema: Option<String>,
 
     /// RSA private key file for `SNOWFLAKE_JWT` authentication.
+    ///
+    /// The file must contain a PEM-encoded PKCS#8 RSA private key.
     pub private_key_file: String,
 
     /// RSA private key passphrase for `SNOWFLAKE_JWT` authentication.
     ///
-    /// Required when `private_key_file` contains an encrypted private key.
+    /// Required when `private_key_file` contains an encrypted PKCS#8 private
+    /// key.
     #[serde(
         default,
         alias = "private_key_passphrase",

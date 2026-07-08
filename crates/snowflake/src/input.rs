@@ -306,7 +306,7 @@ impl SnowflakeInputEndpointInner {
                     .context("Snowflake Arrow batch parser task failed")
                 }
             })
-            .buffered(self.config.num_parsers as usize);
+            .buffer_unordered(self.config.num_parsers as usize);
 
         while let Some(parsed_batch) = parsed_batches.next().await {
             wait_running(&mut receiver).await;
