@@ -4140,6 +4140,7 @@ dependencies = [
  "feldera-observability",
  "feldera-samply",
  "feldera-size-of",
+ "feldera-snowflake",
  "feldera-sqllib",
  "feldera-storage",
  "feldera-types",
@@ -5478,6 +5479,33 @@ dependencies = [
  "size-of-derive",
  "time",
  "xxhash-rust",
+]
+
+[[package]]
+name = "feldera-snowflake"
+version = "0.324.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "async-compression",
+ "async-stream",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "dbsp",
+ "feldera-adapterlib",
+ "feldera-types",
+ "flate2",
+ "futures-util",
+ "jsonwebtoken",
+ "log",
+ "openssl",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]

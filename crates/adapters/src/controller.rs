@@ -8415,7 +8415,7 @@ impl ControllerInner {
                 }
                 TransactionState::Started {
                     tid,
-                    start,
+                    start: _,
                     processed_records,
                 } if next.is_none() || next != open => {
                     // The next step belongs to a different transaction, or the
