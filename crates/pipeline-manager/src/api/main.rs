@@ -35,6 +35,7 @@ use tokio::sync::watch;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, Level};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::openapi::{RefOr, Schema};
 use utoipa::{Modify, OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -52,7 +53,7 @@ macro_rules! log_with_level {
 
 #[derive(OpenApi)]
 #[openapi(
-    modifiers(&SecurityAddon),
+    modifiers(&SecurityAddon, &HideUnknownTransport),
     info(
         title = "Feldera API",
         description = r#"
@@ -739,6 +740,24 @@ impl Modify for SecurityAddon {
     }
 }
 
+struct HideUnknownTransport;
+
+// Utoipa cannot skip an enum variant only in the schema yet:
+// https://github.com/juhaku/utoipa/pull/1513
+impl Modify for HideUnknownTransport {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let Some(RefOr::T(Schema::OneOf(schema))) = openapi
+            .components
+            .as_mut()
+            .and_then(|components| components.schemas.get_mut("TransportConfig"))
+        else {
+            return;
+        };
+
+        schema.items.pop();
+    }
+}
+
 // The below types and methods are used for running the api-server
 
 pub(crate) struct ServerState {
@@ -1040,6 +1059,24 @@ mod tests {
     use super::*;
     use actix_web::http::Method;
     use actix_web::test;
+
+    #[actix_web::test]
+    async fn openapi_hides_unknown_transport_fallback() {
+        let transport = ApiDoc::openapi()
+            .components
+            .unwrap()
+            .schemas
+            .remove("TransportConfig")
+            .unwrap();
+        let RefOr::T(Schema::OneOf(transport)) = transport else {
+            panic!("TransportConfig must be a oneOf schema");
+        };
+
+        assert_eq!(transport.items.len(), 24);
+        assert!(!serde_json::to_string(&transport)
+            .unwrap()
+            .contains("\"unknown\""));
+    }
 
     /// Content-hashed bundle paths get year-long immutable caching plus
     /// `ACAO: *` so SvelteKit's `crossorigin` script loads can be reused

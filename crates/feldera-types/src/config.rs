@@ -1885,6 +1885,14 @@ pub enum TransportConfig {
     NullOutput,
     /// Input connector that produces no data.
     EmptyInput,
+    /// A transport unknown to this Feldera version, preserved for a newer runtime.
+    #[serde(untagged)]
+    Unknown {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schema(value_type = Object)]
+        config: Option<JsonValue>,
+    },
 }
 
 impl TransportConfig {
@@ -1914,6 +1922,7 @@ impl TransportConfig {
             TransportConfig::ClockInput(_) => "clock".to_string(),
             TransportConfig::NullOutput => "null_output".to_string(),
             TransportConfig::EmptyInput => "empty_input".to_string(),
+            TransportConfig::Unknown { name, .. } => name.clone(),
         }
     }
 

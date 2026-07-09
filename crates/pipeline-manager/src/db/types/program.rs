@@ -731,7 +731,8 @@ pub fn generate_program_info(
                 | TransportConfig::IcebergInput(_)
                 | TransportConfig::Datagen(_)
                 | TransportConfig::Nexmark(_)
-                | TransportConfig::EmptyInput => {}
+                | TransportConfig::EmptyInput
+                | TransportConfig::Unknown { .. } => {}
                 _ => {
                     return Err(ConnectorGenerationError::ExpectedInputConnector {
                         position: origin_value.value_position,
@@ -780,7 +781,8 @@ pub fn generate_program_info(
                 | TransportConfig::DeltaTableOutput(_)
                 | TransportConfig::DynamoDBOutput(_)
                 | TransportConfig::RedisOutput(_)
-                | TransportConfig::NullOutput => {}
+                | TransportConfig::NullOutput
+                | TransportConfig::Unknown { .. } => {}
                 _ => {
                     return Err(ConnectorGenerationError::ExpectedOutputConnector {
                         position: origin_value.value_position,
