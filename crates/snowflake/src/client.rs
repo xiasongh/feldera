@@ -258,6 +258,7 @@ mod tests {
                 .context("SNOWFLAKE_PRIVATE_KEY_FILE is not set")?,
             private_key_file_pwd: env::var("SNOWFLAKE_PRIVATE_KEY_FILE_PWD").ok(),
             table: "unused".to_string(),
+            column_mapping: Default::default(),
             mode: Default::default(),
             transaction_mode: Default::default(),
             snapshot_filter: None,

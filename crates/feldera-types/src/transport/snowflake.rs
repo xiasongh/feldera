@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use utoipa::ToSchema;
 
 /// Snowflake table read mode.
@@ -107,6 +108,20 @@ pub struct SnowflakeReaderConfig {
     /// `database` and `schema` are configured on the Snowflake session.
     pub table: String,
 
+    /// Map Feldera table columns to Snowflake source columns.
+    ///
+    /// Each key is the bare name of a column in the Feldera SQL table this
+    /// connector is attached to (without SQL quote delimiters). Each value is
+    /// the corresponding Snowflake SQL column identifier. The connector aliases
+    /// mapped columns back to their Feldera names in the generated snapshot
+    /// query. Quote a value as a Snowflake SQL identifier when its spelling is
+    /// case-sensitive.
+    ///
+    /// For example, `{"uuid": "UUID"}` reads the Snowflake column `UUID`
+    /// into the Feldera column `"uuid"`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub column_mapping: BTreeMap<String, String>,
+
     /// Table read mode.
     ///
     /// Only `"snapshot"` is supported.
@@ -169,6 +184,17 @@ impl SnowflakeReaderConfig {
             }
         }
 
+        for (feldera_column, snowflake_column) in &self.column_mapping {
+            if feldera_column.trim().is_empty() {
+                return Err("'column_mapping' contains an empty Feldera column name".to_string());
+            }
+            if snowflake_column.trim().is_empty() {
+                return Err(format!(
+                    "'column_mapping' contains an empty Snowflake column name for Feldera column '{feldera_column}'"
+                ));
+            }
+        }
+
         for (name, value) in [
             ("role", &self.role),
             ("warehouse", &self.warehouse),
@@ -225,6 +251,7 @@ mod tests {
             private_key_file: "/secrets/key.p8".to_string(),
             private_key_file_pwd: None,
             table: "DB.SCHEMA.TABLE".to_string(),
+            column_mapping: BTreeMap::new(),
             mode: SnowflakeIngestMode::Snapshot,
             transaction_mode: SnowflakeTransactionMode::None,
             snapshot_filter: None,
@@ -294,5 +321,49 @@ mod tests {
 
         assert_eq!(config.private_key_file_pwd.as_deref(), Some("secret"));
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_column_mapping() {
+        let config: SnowflakeReaderConfig = serde_json::from_str(
+            r#"{
+                "account": "org-account",
+                "user": "svc_user",
+                "private_key_file": "/secrets/key.p8",
+                "table": "DB.SCHEMA.TABLE",
+                "column_mapping": {
+                    "uuid": "UUID"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.column_mapping.get("uuid").unwrap(), "UUID");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_column_mapping_names() {
+        let mut config = minimal_config();
+        config
+            .column_mapping
+            .insert("uuid".to_string(), String::new());
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("Snowflake column name")
+        );
+
+        let mut config = minimal_config();
+        config
+            .column_mapping
+            .insert(" ".to_string(), "UUID".to_string());
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("Feldera column name")
+        );
     }
 }

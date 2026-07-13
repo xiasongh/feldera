@@ -6,6 +6,8 @@ import org.dbsp.sqlCompiler.compiler.frontend.connectors.ConfigReporter;
 import org.dbsp.sqlCompiler.compiler.frontend.connectors.IValidateConfig;
 
 import javax.annotation.Nullable;
+import java.util.HashMap;
+import java.util.Map;
 
 /** Configuration for reading snapshots from Snowflake. */
 @SuppressWarnings("unused")
@@ -46,6 +48,9 @@ public class SnowflakeReaderConfig implements IValidateConfig {
     @JsonProperty("table")
     public String table = "";
 
+    @JsonProperty("column_mapping")
+    public Map<String, String> columnMapping = new HashMap<>();
+
     @JsonProperty("mode")
     public SnowflakeIngestMode mode = SnowflakeIngestMode.Snapshot;
 
@@ -73,6 +78,25 @@ public class SnowflakeReaderConfig implements IValidateConfig {
         ok &= this.checkNonEmpty(reporter, this.user, "user");
         ok &= this.checkNonEmpty(reporter, this.privateKeyFile, "private_key_file");
         ok &= this.checkNonEmpty(reporter, this.table, "table");
+
+        if (this.columnMapping == null) {
+            reporter.warnPath("column_mapping", "Invalid configuration",
+                    "\"column_mapping\" must be an object");
+            ok = false;
+        } else {
+            for (Map.Entry<String, String> entry : this.columnMapping.entrySet()) {
+                if (entry.getKey().isBlank()) {
+                    reporter.warnPath("column_mapping", "Invalid configuration",
+                            "\"column_mapping\" contains an empty Feldera column name");
+                    ok = false;
+                }
+                if (entry.getValue() == null || entry.getValue().isBlank()) {
+                    reporter.warnPath("column_mapping", "Invalid configuration",
+                            "\"column_mapping\" contains an empty Snowflake column name");
+                    ok = false;
+                }
+            }
+        }
 
         ok &= checkOptionalNonEmpty(reporter, this.role, "role");
         ok &= checkOptionalNonEmpty(reporter, this.warehouse, "warehouse");

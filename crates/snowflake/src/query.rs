@@ -16,7 +16,7 @@ use reqwest::{
 use serde::Deserialize;
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io,
     pin::Pin,
     sync::atomic::Ordering,
@@ -41,10 +41,40 @@ pub(crate) struct SnowflakeArrowBatchStream<'a> {
     pub(crate) batches: BoxStream<'a, AnyResult<RecordBatch>>,
 }
 
+fn snowflake_column_identifier(identifier: &str) -> AnyResult<&str> {
+    let identifier = identifier.trim();
+
+    if identifier.starts_with('"') {
+        if identifier.len() < 2 || !identifier.ends_with('"') {
+            bail!("invalid quoted Snowflake column identifier '{identifier}'");
+        }
+
+        let mut characters = identifier[1..identifier.len() - 1].chars();
+        while let Some(character) = characters.next() {
+            if character == '"' && characters.next() != Some('"') {
+                bail!("invalid quoted Snowflake column identifier '{identifier}'");
+            }
+        }
+
+        return Ok(identifier);
+    }
+
+    let mut characters = identifier.chars();
+    if !matches!(characters.next(), Some(character) if character.is_ascii_alphabetic() || character == '_')
+        || !characters
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '$'))
+    {
+        bail!("invalid Snowflake column identifier '{identifier}'");
+    }
+
+    Ok(identifier)
+}
+
 pub(crate) fn build_snapshot_query(
     table: &str,
     snapshot_filter: Option<&str>,
     skip_unused_columns: bool,
+    column_mapping: &BTreeMap<String, String>,
     relation: &Relation,
 ) -> AnyResult<String> {
     let table = table.trim();
@@ -54,6 +84,34 @@ pub(crate) fn build_snapshot_query(
 
     let skip_unused_columns =
         skip_unused_columns || relation.get_property("skip_unused_columns") == Some("true");
+    let mut source_columns = HashMap::new();
+    for (target, source) in column_mapping {
+        let target_lowercase = target.to_lowercase();
+        let field = relation
+            .fields
+            .iter()
+            .find(|field| field.name.case_sensitive && field.name.name() == *target)
+            .or_else(|| {
+                relation.fields.iter().find(|field| {
+                    !field.name.case_sensitive && field.name.name() == target_lowercase
+                })
+            });
+        let Some(field) = field else {
+            bail!(
+                "Snowflake column mapping refers to unknown Feldera column '{target}' in input relation '{}'",
+                relation.name
+            );
+        };
+
+        let source = snowflake_column_identifier(source)?;
+        let target = field.name.name();
+        if source_columns.insert(target.clone(), source).is_some() {
+            bail!(
+                "Snowflake column mapping contains multiple entries for Feldera column '{target}'"
+            );
+        }
+    }
+
     let columns = relation
         .fields
         .iter()
@@ -62,7 +120,12 @@ pub(crate) fn build_snapshot_query(
                 || !field.unused
                 || (!field.columntype.nullable && field.default.is_none())
         })
-        .map(|field| field.name.sql_name())
+        .map(|field| {
+            source_columns.get(&field.name.name()).map_or_else(
+                || field.name.sql_name(),
+                |source| format!("{source} AS {}", field.name.sql_name()),
+            )
+        })
         .collect::<Vec<_>>();
 
     if columns.is_empty() {
@@ -439,6 +502,7 @@ mod tests {
             "DB.SCHEMA.T",
             Some("ID > 10"),
             false,
+            &BTreeMap::new(),
             &relation(&["ID", "\"customer name\""]),
         )
         .unwrap();
@@ -455,7 +519,7 @@ mod tests {
         relation.fields[1].unused = true;
 
         assert_eq!(
-            build_snapshot_query("T", None, false, &relation).unwrap(),
+            build_snapshot_query("T", None, false, &BTreeMap::new(), &relation).unwrap(),
             "SELECT ID, UNUSED FROM T"
         );
     }
@@ -480,7 +544,7 @@ mod tests {
         );
 
         assert_eq!(
-            build_snapshot_query("T", None, false, &relation).unwrap(),
+            build_snapshot_query("T", None, false, &BTreeMap::new(), &relation).unwrap(),
             "SELECT ID FROM T"
         );
     }
@@ -491,7 +555,7 @@ mod tests {
         relation.fields[1].unused = true;
 
         assert_eq!(
-            build_snapshot_query("T", None, true, &relation).unwrap(),
+            build_snapshot_query("T", None, true, &BTreeMap::new(), &relation).unwrap(),
             "SELECT ID FROM T"
         );
     }
@@ -503,15 +567,90 @@ mod tests {
         relation.fields[1].columntype.nullable = false;
 
         assert_eq!(
-            build_snapshot_query("T", None, true, &relation).unwrap(),
+            build_snapshot_query("T", None, true, &BTreeMap::new(), &relation).unwrap(),
             "SELECT ID, REQUIRED FROM T"
         );
     }
 
     #[test]
     fn rejects_empty_table() {
-        let err = build_snapshot_query(" ", None, false, &relation(&["ID"])).unwrap_err();
+        let err = build_snapshot_query(" ", None, false, &BTreeMap::new(), &relation(&["ID"]))
+            .unwrap_err();
         assert!(err.to_string().contains("table name"));
+    }
+
+    #[test]
+    fn maps_snowflake_columns_to_feldera_columns() {
+        let mapping = BTreeMap::from([
+            ("uuid".to_string(), "UUID".to_string()),
+            ("status".to_string(), "\"applicationStatus\"".to_string()),
+            ("CamelCase".to_string(), "CAMEL_CASE".to_string()),
+        ]);
+
+        let query = build_snapshot_query(
+            "T",
+            None,
+            false,
+            &mapping,
+            &relation(&[
+                "\"uuid\"",
+                "STATUS",
+                "CAMELCASE",
+                "\"CamelCase\"",
+                "UNCHANGED",
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            query,
+            "SELECT UUID AS \"uuid\", \"applicationStatus\" AS STATUS, CAMELCASE, CAMEL_CASE AS \"CamelCase\", UNCHANGED FROM T"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_column_mapping_target() {
+        let mapping = BTreeMap::from([("missing".to_string(), "UUID".to_string())]);
+
+        let error =
+            build_snapshot_query("T", None, false, &mapping, &relation(&["\"uuid\""])).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unknown Feldera column 'missing'"));
+    }
+
+    #[test]
+    fn rejects_duplicate_mapping_for_case_insensitive_column() {
+        let mapping = BTreeMap::from([
+            ("status".to_string(), "STATUS_A".to_string()),
+            ("STATUS".to_string(), "STATUS_B".to_string()),
+        ]);
+
+        let error =
+            build_snapshot_query("T", None, false, &mapping, &relation(&["STATUS"])).unwrap_err();
+
+        assert!(error.to_string().contains("multiple entries"));
+    }
+
+    #[test]
+    fn validates_mapped_snowflake_column_identifier() {
+        let valid_mapping = BTreeMap::from([(
+            "target".to_string(),
+            "\"source with \"\"quote\"\"\"".to_string(),
+        )]);
+        assert_eq!(
+            build_snapshot_query("T", None, false, &valid_mapping, &relation(&["TARGET"]),)
+                .unwrap(),
+            "SELECT \"source with \"\"quote\"\"\" AS TARGET FROM T"
+        );
+
+        for source in ["source, other", "source AS other", "unterminated\""] {
+            let mapping = BTreeMap::from([("target".to_string(), source.to_string())]);
+            let error = build_snapshot_query("T", None, false, &mapping, &relation(&["TARGET"]))
+                .unwrap_err();
+            assert!(error.to_string().contains("Snowflake column identifier"));
+        }
     }
 
     #[tokio::test]

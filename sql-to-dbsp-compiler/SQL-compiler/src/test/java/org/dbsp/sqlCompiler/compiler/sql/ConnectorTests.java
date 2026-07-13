@@ -1002,6 +1002,9 @@ public class ConnectorTests extends BaseSQLTests {
                     "warehouse": "DEVELOPER",
                     "private_key_file": "/secrets/key.p8",
                     "table": "DB.SCHEMA.TABLE",
+                    "column_mapping": {
+                      "x": "UUID"
+                    },
                     "mode": "snapshot",
                     "transaction_mode": "snapshot",
                     "num_parsers": 4,
@@ -1039,6 +1042,24 @@ public class ConnectorTests extends BaseSQLTests {
                   }
                 }""",
                 "\"num_parsers\" must be greater than 0");
+    }
+
+    @Test
+    public void snowflakeReaderRejectsEmptyColumnMapping() {
+        tableConnectorTest("""
+                "transport": {
+                  "name": "snowflake_input",
+                  "config": {
+                    "account": "org-account",
+                    "user": "svc_user",
+                    "private_key_file": "/secrets/key.p8",
+                    "table": "DB.SCHEMA.TABLE",
+                    "column_mapping": {
+                      "uuid": ""
+                    }
+                  }
+                }""",
+                "\"column_mapping\" contains an empty Snowflake column name");
     }
 
     // ---- File transport config ----
