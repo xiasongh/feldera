@@ -226,7 +226,11 @@ fn user_agent() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use feldera_types::transport::snowflake::SnowflakeAuthenticator;
+    use arrow::{
+        array::{Array, Decimal128Array, Float64Array},
+        datatypes::DataType,
+    };
+    use feldera_types::transport::snowflake::{SnowflakeAuthenticator, SnowflakeNumberMode};
     use futures_util::StreamExt;
 
     #[test]
@@ -259,6 +263,7 @@ mod tests {
             private_key_file_pwd: env::var("SNOWFLAKE_PRIVATE_KEY_FILE_PWD").ok(),
             table: "unused".to_string(),
             column_mapping: Default::default(),
+            number_mode: Default::default(),
             mode: Default::default(),
             transaction_mode: Default::default(),
             snapshot_filter: None,
@@ -267,16 +272,57 @@ mod tests {
             max_concurrent_readers: None,
         };
         let client = SnowflakeClient::from_reader_config(&config).await?;
-        let query =
-            env::var("SNOWFLAKE_TEST_QUERY").unwrap_or_else(|_| "select 1::int as ID".to_string());
-        let result = client.query_arrow_batch_stream(&query, 1).await?;
-        let batches = result.batches.collect::<Vec<_>>().await;
-        let batches = batches.into_iter().collect::<AnyResult<Vec<_>>>()?;
-        let rows = batches
-            .into_iter()
-            .map(|batch| batch.num_rows())
-            .sum::<usize>();
-        assert_eq!(rows, 1);
+        let custom_query = env::var("SNOWFLAKE_TEST_QUERY").ok();
+        let using_default_query = custom_query.is_none();
+        let query = custom_query.unwrap_or_else(|| {
+            "select -1.23::number(10,2) as AMOUNT, 12::number(10,0) as ID, null::number(10,2) as OPTIONAL_AMOUNT"
+                .to_string()
+        });
+        for (number_mode, expected_type) in [
+            (SnowflakeNumberMode::Decimal, DataType::Decimal128(10, 2)),
+            (SnowflakeNumberMode::Double, DataType::Float64),
+        ] {
+            let result = client
+                .query_arrow_batch_stream(&query, 1, number_mode)
+                .await?;
+            let batches = result.batches.collect::<Vec<_>>().await;
+            let batches = batches.into_iter().collect::<AnyResult<Vec<_>>>()?;
+            assert_eq!(
+                batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                1
+            );
+            if using_default_query {
+                assert_eq!(batches[0].schema().field(0).data_type(), &expected_type);
+                assert!(matches!(
+                    batches[0].schema().field(1).data_type(),
+                    DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::Decimal128(_, 0)
+                ));
+                match number_mode {
+                    SnowflakeNumberMode::Decimal => {
+                        let amounts = batches[0]
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Decimal128Array>()
+                            .unwrap();
+                        assert_eq!(amounts.value(0), -123);
+                        assert!(batches[0].column(2).is_null(0));
+                    }
+                    SnowflakeNumberMode::Double => {
+                        let amounts = batches[0]
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .unwrap();
+                        assert_eq!(amounts.value(0), -1.23);
+                        assert!(batches[0].column(2).is_null(0));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }

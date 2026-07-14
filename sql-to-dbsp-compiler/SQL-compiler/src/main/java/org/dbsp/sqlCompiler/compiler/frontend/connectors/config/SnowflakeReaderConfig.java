@@ -51,6 +51,9 @@ public class SnowflakeReaderConfig implements IValidateConfig {
     @JsonProperty("column_mapping")
     public Map<String, String> columnMapping = new HashMap<>();
 
+    @JsonProperty("number_mode")
+    public SnowflakeNumberMode numberMode = SnowflakeNumberMode.Decimal;
+
     @JsonProperty("mode")
     public SnowflakeIngestMode mode = SnowflakeIngestMode.Snapshot;
 

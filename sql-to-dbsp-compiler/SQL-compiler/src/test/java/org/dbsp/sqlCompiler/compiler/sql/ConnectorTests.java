@@ -1005,6 +1005,7 @@ public class ConnectorTests extends BaseSQLTests {
                     "column_mapping": {
                       "x": "UUID"
                     },
+                    "number_mode": "double",
                     "mode": "snapshot",
                     "transaction_mode": "snapshot",
                     "num_parsers": 4,

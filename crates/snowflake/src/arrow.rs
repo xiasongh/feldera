@@ -3,25 +3,32 @@ use std::io::Cursor;
 use anyhow::{anyhow, bail, Context, Result as AnyResult};
 use arrow::{
     array::{
-        Array, Decimal128Array, Int16Array, Int32Array, Int64Array, Int8Array, StructArray,
-        Time64NanosecondArray, TimestampMicrosecondArray,
+        Array, ArrayRef, Decimal128Array, Float64Array, Int16Array, Int32Array, Int64Array,
+        Int8Array, StructArray, Time64NanosecondArray, TimestampMicrosecondArray,
     },
     datatypes::{DataType, Field, Schema, TimeUnit},
     ipc::reader::StreamReader,
     record_batch::RecordBatch,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use feldera_types::transport::snowflake::SnowflakeNumberMode;
 
 /// Decode an inline Snowflake `rowsetBase64` payload into Arrow record batches.
-pub(crate) fn decode_base64_ipc_stream(rowset_base64: &str) -> AnyResult<Vec<RecordBatch>> {
+pub(crate) fn decode_base64_ipc_stream(
+    rowset_base64: &str,
+    number_mode: SnowflakeNumberMode,
+) -> AnyResult<Vec<RecordBatch>> {
     let bytes = BASE64_STANDARD
         .decode(rowset_base64)
         .context("invalid base64 in Snowflake Arrow rowset")?;
-    decode_ipc_stream(&bytes)
+    decode_ipc_stream(&bytes, number_mode)
 }
 
 /// Decode a raw Snowflake Arrow chunk into Arrow record batches.
-pub(crate) fn decode_ipc_stream(bytes: &[u8]) -> AnyResult<Vec<RecordBatch>> {
+pub(crate) fn decode_ipc_stream(
+    bytes: &[u8],
+    number_mode: SnowflakeNumberMode,
+) -> AnyResult<Vec<RecordBatch>> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
@@ -31,12 +38,15 @@ pub(crate) fn decode_ipc_stream(bytes: &[u8]) -> AnyResult<Vec<RecordBatch>> {
 
     reader
         .map(|batch| batch.context("error reading Snowflake Arrow IPC record batch"))
-        .map(|batch| batch.and_then(normalize_snowflake_batch))
+        .map(|batch| batch.and_then(|batch| normalize_snowflake_batch(batch, number_mode)))
         .collect()
 }
 
 /// Convert Snowflake-specific Arrow encodings into standard Arrow types understood by Feldera.
-pub(crate) fn normalize_snowflake_batch(batch: RecordBatch) -> AnyResult<RecordBatch> {
+pub(crate) fn normalize_snowflake_batch(
+    batch: RecordBatch,
+    number_mode: SnowflakeNumberMode,
+) -> AnyResult<RecordBatch> {
     let schema = batch.schema();
     let mut fields = Vec::with_capacity(schema.fields().len());
     let mut columns = Vec::with_capacity(batch.num_columns());
@@ -48,16 +58,23 @@ pub(crate) fn normalize_snowflake_batch(batch: RecordBatch) -> AnyResult<RecordB
         // applies the scale during conversion as well:
         // https://github.com/snowflakedb/libsnowflakeclient/blob/master/cpp/lib/ArrowChunkIterator.cpp
         if logical_type == Some("FIXED") && field_scale(field)? != 0 {
-            let decimals = normalize_fixed(field.as_ref(), column.as_ref())?;
+            let normalized: ArrayRef = match number_mode {
+                SnowflakeNumberMode::Decimal => {
+                    std::sync::Arc::new(normalize_fixed(field.as_ref(), column.as_ref())?)
+                }
+                SnowflakeNumberMode::Double => {
+                    std::sync::Arc::new(normalize_fixed_to_double(field.as_ref(), column.as_ref())?)
+                }
+            };
             fields.push(
                 Field::new(
                     field.name(),
-                    decimals.data_type().clone(),
+                    normalized.data_type().clone(),
                     field.is_nullable(),
                 )
                 .with_metadata(field.metadata().clone()),
             );
-            columns.push(std::sync::Arc::new(decimals) as _);
+            columns.push(normalized);
         } else if matches!(
             logical_type,
             Some("TIMESTAMP_NTZ" | "TIMESTAMP_LTZ" | "TIMESTAMP_TZ")
@@ -115,7 +132,7 @@ fn normalize_fixed(field: &Field, column: &dyn Array) -> AnyResult<Decimal128Arr
     }
 
     let values = (0..column.len())
-        .map(|row| signed_integer_at(column, row, field.name()).map(|value| value.map(i128::from)))
+        .map(|row| fixed_integer_at(column, row, field.name()))
         .collect::<AnyResult<Vec<_>>>()?;
 
     Decimal128Array::from(values)
@@ -126,6 +143,26 @@ fn normalize_fixed(field: &Field, column: &dyn Array) -> AnyResult<Decimal128Arr
                 field.name()
             )
         })
+}
+
+fn normalize_fixed_to_double(field: &Field, column: &dyn Array) -> AnyResult<Float64Array> {
+    let scale = field_metadata::<i32>(field, "scale")?;
+    let divisor = 10_f64.powi(scale);
+
+    (0..column.len())
+        .map(|row| {
+            fixed_integer_at(column, row, field.name())
+                .map(|value| value.map(|value| value as f64 / divisor))
+        })
+        .collect()
+}
+
+fn fixed_integer_at(column: &dyn Array, row: usize, field_name: &str) -> AnyResult<Option<i128>> {
+    if let Some(values) = column.as_any().downcast_ref::<Decimal128Array>() {
+        return Ok((!values.is_null(row)).then(|| values.value(row)));
+    }
+
+    signed_integer_at(column, row, field_name).map(|value| value.map(i128::from))
 }
 
 fn normalize_timestamp(
@@ -288,7 +325,7 @@ fn struct_child<'a, T: Array + 'static>(
 mod tests {
     use super::*;
     use arrow::{
-        array::{ArrayRef, Int32Array, Int64Array, StringArray, StructArray},
+        array::{Int32Array, Int64Array, StringArray, StructArray},
         datatypes::{DataType, Field, Schema},
         ipc::writer::StreamWriter,
     };
@@ -316,7 +353,7 @@ mod tests {
             writer.finish().unwrap();
         }
 
-        let batches = decode_ipc_stream(&bytes).unwrap();
+        let batches = decode_ipc_stream(&bytes, SnowflakeNumberMode::Decimal).unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 2);
         assert_eq!(batches[0].schema().field(0).name(), "ID");
@@ -358,7 +395,7 @@ mod tests {
         )
         .unwrap();
 
-        let normalized = normalize_snowflake_batch(batch).unwrap();
+        let normalized = normalize_snowflake_batch(batch, SnowflakeNumberMode::Decimal).unwrap();
         assert_eq!(
             normalized.schema().field(0).data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
@@ -391,7 +428,7 @@ mod tests {
         )
         .unwrap();
 
-        let normalized = normalize_snowflake_batch(batch).unwrap();
+        let normalized = normalize_snowflake_batch(batch, SnowflakeNumberMode::Decimal).unwrap();
         let timestamp = normalized
             .column(0)
             .as_any()
@@ -419,7 +456,7 @@ mod tests {
         )
         .unwrap();
 
-        let normalized = normalize_snowflake_batch(batch).unwrap();
+        let normalized = normalize_snowflake_batch(batch, SnowflakeNumberMode::Decimal).unwrap();
         assert_eq!(
             normalized.schema().field(0).data_type(),
             &DataType::Decimal128(10, 2)
@@ -431,5 +468,71 @@ mod tests {
             .unwrap();
         assert_eq!(values.value(0), 123);
         assert!(values.is_null(1));
+    }
+
+    #[test]
+    fn converts_scaled_fixed_integers_to_double() {
+        let field = Field::new("AMOUNT", DataType::Int8, true).with_metadata(HashMap::from([
+            ("logicalType".to_string(), "FIXED".to_string()),
+            ("precision".to_string(), "10".to_string()),
+            ("scale".to_string(), "2".to_string()),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field])),
+            vec![Arc::new(Int8Array::from(vec![Some(123), None]))],
+        )
+        .unwrap();
+
+        let normalized = normalize_snowflake_batch(batch, SnowflakeNumberMode::Double).unwrap();
+        assert_eq!(normalized.schema().field(0).data_type(), &DataType::Float64);
+        let values = normalized
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 1.23);
+        assert!(values.is_null(1));
+    }
+
+    #[test]
+    fn converts_scaled_decimal128_to_double() {
+        let field =
+            Field::new("AMOUNT", DataType::Decimal128(38, 2), true).with_metadata(HashMap::from([
+                ("logicalType".to_string(), "FIXED".to_string()),
+                ("precision".to_string(), "38".to_string()),
+                ("scale".to_string(), "2".to_string()),
+            ]));
+        let values = Decimal128Array::from(vec![Some(-123), None])
+            .with_precision_and_scale(38, 2)
+            .unwrap();
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(values)])
+                .unwrap();
+
+        let normalized = normalize_snowflake_batch(batch, SnowflakeNumberMode::Double).unwrap();
+        let values = normalized
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), -1.23);
+        assert!(values.is_null(1));
+    }
+
+    #[test]
+    fn double_mode_leaves_scale_zero_numbers_integral() {
+        let field = Field::new("ID", DataType::Int8, false).with_metadata(HashMap::from([
+            ("logicalType".to_string(), "FIXED".to_string()),
+            ("precision".to_string(), "10".to_string()),
+            ("scale".to_string(), "0".to_string()),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![field])),
+            vec![Arc::new(Int8Array::from(vec![123]))],
+        )
+        .unwrap();
+
+        let normalized = normalize_snowflake_batch(batch, SnowflakeNumberMode::Double).unwrap();
+        assert_eq!(normalized.schema().field(0).data_type(), &DataType::Int8);
     }
 }

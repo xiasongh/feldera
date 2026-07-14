@@ -252,7 +252,11 @@ impl SnowflakeInputEndpointInner {
         };
 
         let result_stream = match client
-            .query_arrow_batch_stream(&query, self.config.max_concurrent_readers())
+            .query_arrow_batch_stream(
+                &query,
+                self.config.max_concurrent_readers(),
+                self.config.number_mode,
+            )
             .await
         {
             Ok(result) => result,

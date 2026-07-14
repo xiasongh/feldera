@@ -7,7 +7,7 @@ use arrow::{buffer::Buffer, ipc::reader::StreamDecoder, record_batch::RecordBatc
 use async_compression::tokio::bufread::GzipDecoder;
 use async_stream::try_stream;
 use bytes::BytesMut;
-use feldera_types::program_schema::Relation;
+use feldera_types::{program_schema::Relation, transport::snowflake::SnowflakeNumberMode};
 use futures_util::{stream, stream::BoxStream, StreamExt, TryStreamExt};
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, CONTENT_ENCODING},
@@ -179,6 +179,7 @@ impl SnowflakeClient {
         &self,
         sql: &str,
         max_concurrent_readers: usize,
+        number_mode: SnowflakeNumberMode,
     ) -> AnyResult<SnowflakeArrowBatchStream<'_>> {
         let data = self.execute_statement(sql).await?;
         let format = data.query_result_format.as_deref().unwrap_or_default();
@@ -189,7 +190,7 @@ impl SnowflakeClient {
         let inline_batches = data
             .rowset_base64
             .as_deref()
-            .map(decode_base64_ipc_stream)
+            .map(|rowset| decode_base64_ipc_stream(rowset, number_mode))
             .transpose()?;
         let chunk_headers = chunk_headers(&data)?;
         let metadata = SnowflakeArrowQueryMetadata {
@@ -206,7 +207,7 @@ impl SnowflakeClient {
         let downloaded_batches = stream::iter(
             data.chunks
                 .into_iter()
-                .map(move |chunk| self.stream_chunk(chunk, chunk_headers.clone())),
+                .map(move |chunk| self.stream_chunk(chunk, chunk_headers.clone(), number_mode)),
         )
         .flatten_unordered(max_concurrent_readers.max(1));
 
@@ -282,6 +283,7 @@ impl SnowflakeClient {
         &'a self,
         chunk: SnowflakeChunk,
         headers: HeaderMap,
+        number_mode: SnowflakeNumberMode,
     ) -> BoxStream<'a, AnyResult<RecordBatch>> {
         try_stream! {
             let chunk_url = redact_url(&chunk.url);
@@ -308,7 +310,7 @@ impl SnowflakeClient {
             } else {
                 Box::pin(body)
             };
-            let mut batches = decode_arrow_reader(reader, chunk_url);
+            let mut batches = decode_arrow_reader(reader, chunk_url, number_mode);
             while let Some(batch) = batches.next().await {
                 yield batch?;
             }
@@ -358,6 +360,7 @@ impl SnowflakeClient {
 fn decode_arrow_reader<R>(
     mut reader: R,
     source: String,
+    number_mode: SnowflakeNumberMode,
 ) -> BoxStream<'static, AnyResult<RecordBatch>>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -381,7 +384,7 @@ where
                     .decode(&mut buffer)
                     .with_context(|| format!("error decoding Arrow IPC data from {source}"))?
                 {
-                    yield normalize_snowflake_batch(batch).with_context(|| {
+                    yield normalize_snowflake_batch(batch, number_mode).with_context(|| {
                         format!("error normalizing Arrow data from {source}")
                     })?;
                 }
@@ -687,7 +690,11 @@ mod tests {
         });
 
         let reader = GzipDecoder::new(BufReader::new(reader));
-        let mut batches = decode_arrow_reader(reader, "test stream".to_string());
+        let mut batches = decode_arrow_reader(
+            reader,
+            "test stream".to_string(),
+            SnowflakeNumberMode::Decimal,
+        );
         let first = timeout(Duration::from_secs(2), batches.next())
             .await
             .expect("first batch was not decoded before gzip EOF")

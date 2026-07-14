@@ -44,6 +44,21 @@ pub enum SnowflakeTransactionMode {
     Snapshot,
 }
 
+/// Representation of scaled Snowflake `NUMBER` values.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Deserialize, Serialize, ToSchema)]
+pub enum SnowflakeNumberMode {
+    /// Convert scaled `NUMBER` values to Arrow Decimal128, preserving precision.
+    #[default]
+    #[serde(rename = "decimal")]
+    Decimal,
+
+    /// Convert scaled `NUMBER` values to Arrow Float64.
+    ///
+    /// This can lose precision. Scale-zero `NUMBER` values remain integral.
+    #[serde(rename = "double")]
+    Double,
+}
+
 const DEFAULT_MAX_CONCURRENT_READERS: u32 = 4;
 
 fn default_num_parsers() -> u32 {
@@ -121,6 +136,13 @@ pub struct SnowflakeReaderConfig {
     /// into the Feldera column `"uuid"`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub column_mapping: BTreeMap<String, String>,
+
+    /// Representation of scaled Snowflake `NUMBER` values.
+    ///
+    /// Defaults to `"decimal"`, which preserves precision. Set to `"double"`
+    /// to convert these values to double-precision floating point.
+    #[serde(default)]
+    pub number_mode: SnowflakeNumberMode,
 
     /// Table read mode.
     ///
@@ -252,6 +274,7 @@ mod tests {
             private_key_file_pwd: None,
             table: "DB.SCHEMA.TABLE".to_string(),
             column_mapping: BTreeMap::new(),
+            number_mode: SnowflakeNumberMode::Decimal,
             mode: SnowflakeIngestMode::Snapshot,
             transaction_mode: SnowflakeTransactionMode::None,
             snapshot_filter: None,
@@ -303,6 +326,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.transaction_mode, SnowflakeTransactionMode::Snapshot);
+        assert_eq!(config.number_mode, SnowflakeNumberMode::Decimal);
         config.validate().unwrap();
     }
 
@@ -340,6 +364,22 @@ mod tests {
 
         assert_eq!(config.column_mapping.get("uuid").unwrap(), "UUID");
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_number_mode() {
+        let config: SnowflakeReaderConfig = serde_json::from_str(
+            r#"{
+                "account": "org-account",
+                "user": "svc_user",
+                "private_key_file": "/secrets/key.p8",
+                "table": "DB.SCHEMA.TABLE",
+                "number_mode": "double"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.number_mode, SnowflakeNumberMode::Double);
     }
 
     #[test]
