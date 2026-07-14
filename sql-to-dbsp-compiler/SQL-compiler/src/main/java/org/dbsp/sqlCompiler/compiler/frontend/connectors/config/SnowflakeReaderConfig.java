@@ -64,9 +64,6 @@ public class SnowflakeReaderConfig implements IValidateConfig {
     @JsonProperty("snapshot_filter")
     public String snapshotFilter = null;
 
-    @JsonProperty("skip_unused_columns")
-    public boolean skipUnusedColumns = false;
-
     @JsonProperty("num_parsers")
     public int numParsers = 4;
 

@@ -214,7 +214,6 @@ impl SnowflakeInputEndpointInner {
             SnowflakeIngestMode::Snapshot => build_snapshot_query(
                 &self.config.table,
                 self.config.snapshot_filter.as_deref(),
-                self.config.skip_unused_columns,
                 &self.config.column_mapping,
                 &schema,
             ),

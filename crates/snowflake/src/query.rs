@@ -73,7 +73,6 @@ fn snowflake_column_identifier(identifier: &str) -> AnyResult<&str> {
 pub(crate) fn build_snapshot_query(
     table: &str,
     snapshot_filter: Option<&str>,
-    skip_unused_columns: bool,
     column_mapping: &BTreeMap<String, String>,
     relation: &Relation,
 ) -> AnyResult<String> {
@@ -82,8 +81,7 @@ pub(crate) fn build_snapshot_query(
         bail!("Snowflake table name must not be empty");
     }
 
-    let skip_unused_columns =
-        skip_unused_columns || relation.get_property("skip_unused_columns") == Some("true");
+    let skip_unused_columns = relation.get_property("skip_unused_columns") == Some("true");
     let mut source_columns = HashMap::new();
     for (target, source) in column_mapping {
         let target_lowercase = target.to_lowercase();
@@ -499,12 +497,28 @@ mod tests {
         }
     }
 
+    fn enable_skip_unused_columns(relation: &mut Relation) {
+        let position = SourcePosition {
+            start_line_number: 0,
+            start_column: 0,
+            end_line_number: 0,
+            end_column: 0,
+        };
+        relation.properties.insert(
+            "skip_unused_columns".to_string(),
+            PropertyValue {
+                value: "true".to_string(),
+                key_position: position,
+                value_position: position,
+            },
+        );
+    }
+
     #[test]
     fn builds_snapshot_query() {
         let query = build_snapshot_query(
             "DB.SCHEMA.T",
             Some("ID > 10"),
-            false,
             &BTreeMap::new(),
             &relation(&["ID", "\"customer name\""]),
         )
@@ -522,7 +536,7 @@ mod tests {
         relation.fields[1].unused = true;
 
         assert_eq!(
-            build_snapshot_query("T", None, false, &BTreeMap::new(), &relation).unwrap(),
+            build_snapshot_query("T", None, &BTreeMap::new(), &relation).unwrap(),
             "SELECT ID, UNUSED FROM T"
         );
     }
@@ -531,34 +545,10 @@ mod tests {
     fn skips_unused_columns_when_requested_by_table() {
         let mut relation = relation(&["ID", "UNUSED"]);
         relation.fields[1].unused = true;
-        let position = SourcePosition {
-            start_line_number: 0,
-            start_column: 0,
-            end_line_number: 0,
-            end_column: 0,
-        };
-        relation.properties.insert(
-            "skip_unused_columns".to_string(),
-            PropertyValue {
-                value: "true".to_string(),
-                key_position: position,
-                value_position: position,
-            },
-        );
+        enable_skip_unused_columns(&mut relation);
 
         assert_eq!(
-            build_snapshot_query("T", None, false, &BTreeMap::new(), &relation).unwrap(),
-            "SELECT ID FROM T"
-        );
-    }
-
-    #[test]
-    fn skips_unused_columns_when_requested_by_connector() {
-        let mut relation = relation(&["ID", "UNUSED"]);
-        relation.fields[1].unused = true;
-
-        assert_eq!(
-            build_snapshot_query("T", None, true, &BTreeMap::new(), &relation).unwrap(),
+            build_snapshot_query("T", None, &BTreeMap::new(), &relation).unwrap(),
             "SELECT ID FROM T"
         );
     }
@@ -568,17 +558,18 @@ mod tests {
         let mut relation = relation(&["ID", "REQUIRED"]);
         relation.fields[1].unused = true;
         relation.fields[1].columntype.nullable = false;
+        enable_skip_unused_columns(&mut relation);
 
         assert_eq!(
-            build_snapshot_query("T", None, true, &BTreeMap::new(), &relation).unwrap(),
+            build_snapshot_query("T", None, &BTreeMap::new(), &relation).unwrap(),
             "SELECT ID, REQUIRED FROM T"
         );
     }
 
     #[test]
     fn rejects_empty_table() {
-        let err = build_snapshot_query(" ", None, false, &BTreeMap::new(), &relation(&["ID"]))
-            .unwrap_err();
+        let err =
+            build_snapshot_query(" ", None, &BTreeMap::new(), &relation(&["ID"])).unwrap_err();
         assert!(err.to_string().contains("table name"));
     }
 
@@ -593,7 +584,6 @@ mod tests {
         let query = build_snapshot_query(
             "T",
             None,
-            false,
             &mapping,
             &relation(&[
                 "\"uuid\"",
@@ -616,7 +606,7 @@ mod tests {
         let mapping = BTreeMap::from([("missing".to_string(), "UUID".to_string())]);
 
         let error =
-            build_snapshot_query("T", None, false, &mapping, &relation(&["\"uuid\""])).unwrap_err();
+            build_snapshot_query("T", None, &mapping, &relation(&["\"uuid\""])).unwrap_err();
 
         assert!(error
             .to_string()
@@ -630,8 +620,7 @@ mod tests {
             ("STATUS".to_string(), "STATUS_B".to_string()),
         ]);
 
-        let error =
-            build_snapshot_query("T", None, false, &mapping, &relation(&["STATUS"])).unwrap_err();
+        let error = build_snapshot_query("T", None, &mapping, &relation(&["STATUS"])).unwrap_err();
 
         assert!(error.to_string().contains("multiple entries"));
     }
@@ -643,15 +632,14 @@ mod tests {
             "\"source with \"\"quote\"\"\"".to_string(),
         )]);
         assert_eq!(
-            build_snapshot_query("T", None, false, &valid_mapping, &relation(&["TARGET"]),)
-                .unwrap(),
+            build_snapshot_query("T", None, &valid_mapping, &relation(&["TARGET"]),).unwrap(),
             "SELECT \"source with \"\"quote\"\"\" AS TARGET FROM T"
         );
 
         for source in ["source, other", "source AS other", "unterminated\""] {
             let mapping = BTreeMap::from([("target".to_string(), source.to_string())]);
-            let error = build_snapshot_query("T", None, false, &mapping, &relation(&["TARGET"]))
-                .unwrap_err();
+            let error =
+                build_snapshot_query("T", None, &mapping, &relation(&["TARGET"])).unwrap_err();
             assert!(error.to_string().contains("Snowflake column identifier"));
         }
     }

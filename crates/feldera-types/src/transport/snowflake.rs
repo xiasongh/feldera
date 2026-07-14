@@ -165,15 +165,6 @@ pub struct SnowflakeReaderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_filter: Option<String>,
 
-    /// Don't read unused columns from the Snowflake table.
-    ///
-    /// The connector always reads every column declared in the Feldera SQL
-    /// table by default. Set this option to avoid reading declared columns that
-    /// are not used by the pipeline and can be replaced with `NULL` or a
-    /// declared default value.
-    #[serde(default)]
-    pub skip_unused_columns: bool,
-
     /// Number of parallel tasks used to deserialize Arrow record batches.
     ///
     /// Recommended range: 1–10. Default: 4.
@@ -278,7 +269,6 @@ mod tests {
             mode: SnowflakeIngestMode::Snapshot,
             transaction_mode: SnowflakeTransactionMode::None,
             snapshot_filter: None,
-            skip_unused_columns: false,
             num_parsers: default_num_parsers(),
             max_concurrent_readers: None,
         }

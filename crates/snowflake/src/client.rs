@@ -267,7 +267,6 @@ mod tests {
             mode: Default::default(),
             transaction_mode: Default::default(),
             snapshot_filter: None,
-            skip_unused_columns: false,
             num_parsers: 4,
             max_concurrent_readers: None,
         };
