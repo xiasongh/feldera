@@ -1,17 +1,17 @@
 use crate::{client::SnowflakeClient, query::build_snapshot_query, snowflake_input_serde_config};
-use anyhow::{anyhow, Context, Result as AnyResult};
+use anyhow::{Context, Result as AnyResult, anyhow};
 use arrow::record_batch::RecordBatch;
 use chrono::Utc;
 use dbsp::circuit::tokio::TOKIO;
 use feldera_adapterlib::{
+    PipelineState,
     catalog::{ArrowStream, InputCollectionHandle},
     errors::journal::ControllerError,
     format::{InputBuffer, ParseError},
     transport::{
         InputConsumer, InputEndpoint, InputQueue, InputQueueEntry, InputReader, InputReaderCommand,
-        IntegratedInputEndpoint, Watermark,
+        IntegratedInputEndpoint, Resume, Watermark, parse_resume_info,
     },
-    PipelineState,
 };
 use feldera_types::{
     adapter_stats::ConnectorHealth,
@@ -21,12 +21,16 @@ use feldera_types::{
 };
 use futures_util::StreamExt;
 use log::{debug, info};
-use std::{sync::Arc, thread};
+use serde::{Deserialize, Serialize};
+use std::{
+    sync::{Arc, Mutex},
+    thread,
+};
 use tokio::{
     select,
     sync::{
         mpsc,
-        watch::{channel, Receiver, Sender},
+        watch::{Receiver, Sender, channel},
     },
 };
 
@@ -53,7 +57,9 @@ impl SnowflakeInputEndpoint {
 
 impl InputEndpoint for SnowflakeInputEndpoint {
     fn fault_tolerance(&self) -> Option<FtModel> {
-        None
+        // This test-only fault tolerance supports full-refresh checkpoints, not recovery
+        // within a snapshot: before EOI, recovery reruns the entire snapshot.
+        Some(FtModel::AtLeastOnce)
     }
 }
 
@@ -61,12 +67,34 @@ impl IntegratedInputEndpoint for SnowflakeInputEndpoint {
     fn open(
         self: Box<Self>,
         input_handle: &InputCollectionHandle,
-        _seek: Option<serde_json::Value>,
+        seek: Option<serde_json::Value>,
     ) -> AnyResult<Box<dyn InputReader>> {
         Ok(Box::new(SnowflakeInputReader::new(
             &self.inner,
             input_handle,
+            seek,
         )?))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SnowflakeResumeInfo {
+    eoi: bool,
+}
+
+impl SnowflakeResumeInfo {
+    fn initial() -> Self {
+        Self { eoi: false }
+    }
+
+    fn eoi() -> Self {
+        Self { eoi: true }
+    }
+
+    fn to_resume(&self) -> Resume {
+        Resume::Seek {
+            seek: serde_json::to_value(self).unwrap(),
+        }
     }
 }
 
@@ -79,17 +107,28 @@ impl SnowflakeInputReader {
     fn new(
         endpoint: &Arc<SnowflakeInputEndpointInner>,
         input_handle: &InputCollectionHandle,
+        resume_info: Option<serde_json::Value>,
     ) -> AnyResult<Self> {
         endpoint.config.validate().map_err(|e| {
             ControllerError::invalid_transport_configuration(&endpoint.endpoint_name, &e)
         })?;
 
-        let (sender, receiver) = channel(PipelineState::Paused);
-        let endpoint_clone = endpoint.clone();
-        let receiver_clone = receiver.clone();
+        let resume_info = resume_info
+            .as_ref()
+            .map(parse_resume_info::<SnowflakeResumeInfo>)
+            .transpose()?;
+        let eoi = resume_info
+            .as_ref()
+            .is_some_and(|resume_info| resume_info.eoi);
 
-        let (init_status_sender, mut init_status_receiver) =
-            mpsc::channel::<Result<(), ControllerError>>(1);
+        if let Some(resume_info) = &resume_info {
+            *endpoint.last_resume_status.lock().unwrap() = Some(resume_info.clone());
+            endpoint
+                .queue
+                .push_with_aux((None, Vec::new()), Utc::now(), Some(resume_info.clone()));
+        }
+
+        let (sender, receiver) = channel(PipelineState::Paused);
 
         let input_stream = input_handle
             .handle
@@ -97,20 +136,32 @@ impl SnowflakeInputReader {
         let schema = input_handle.schema.clone();
         let endpoint_name = endpoint.endpoint_name.clone();
 
-        thread::Builder::new()
-            .name(format!("{endpoint_name}-snowflake-input-tokio-wrapper"))
-            .spawn(move || {
-                TOKIO.block_on(async {
-                    endpoint_clone
-                        .worker_task(input_stream, schema, receiver_clone, init_status_sender)
-                        .await;
-                })
-            })
-            .expect("failed to spawn snowflake-input tokio wrapper thread");
+        if eoi {
+            info!(
+                "snowflake {endpoint_name}: skipping connector initialization because the snapshot is already complete"
+            );
+            endpoint.consumer.eoi();
+        } else {
+            let endpoint_clone = endpoint.clone();
+            let receiver_clone = receiver.clone();
+            let (init_status_sender, mut init_status_receiver) =
+                mpsc::channel::<Result<(), ControllerError>>(1);
 
-        init_status_receiver.blocking_recv().ok_or_else(|| {
-            anyhow!("worker thread terminated unexpectedly during initialization")
-        })??;
+            thread::Builder::new()
+                .name(format!("{endpoint_name}-snowflake-input-tokio-wrapper"))
+                .spawn(move || {
+                    TOKIO.block_on(async {
+                        endpoint_clone
+                            .worker_task(input_stream, schema, receiver_clone, init_status_sender)
+                            .await;
+                    })
+                })
+                .expect("failed to spawn snowflake-input tokio wrapper thread");
+
+            init_status_receiver.blocking_recv().ok_or_else(|| {
+                anyhow!("worker thread terminated unexpectedly during initialization")
+            })??;
+        }
 
         Ok(Self {
             sender,
@@ -135,14 +186,39 @@ impl InputReader for SnowflakeInputReader {
             InputReaderCommand::Pause => {
                 let _ = self.sender.send_replace(PipelineState::Paused);
             }
-            InputReaderCommand::Queue { .. } => {
-                let (total, _, timestamps) = self.inner.queue.flush_with_aux();
+            InputReaderCommand::Queue {
+                checkpoint_requested,
+            } => {
+                let stop_at: &dyn Fn(&Option<SnowflakeResumeInfo>) -> bool = if checkpoint_requested
+                {
+                    &Option::is_some
+                } else {
+                    &|_| false
+                };
+                let (total, _, resume_info) = self.inner.queue.flush_with_aux_until(stop_at);
+                let resume_status = match resume_info.last() {
+                    None => self.inner.last_resume_status.lock().unwrap().clone(),
+                    Some((_, resume_info)) => resume_info.clone(),
+                };
+                *self.inner.last_resume_status.lock().unwrap() = resume_status.clone();
+
+                let resume = match resume_status {
+                    Some(resume_info) => resume_info.to_resume(),
+                    None => Resume::Barrier,
+                };
+
                 self.inner.consumer.extended(
                     total,
-                    None,
-                    timestamps
+                    Some(resume),
+                    resume_info
                         .into_iter()
-                        .map(|(timestamp, ())| Watermark::new(timestamp, None))
+                        .map(|(timestamp, resume_info)| {
+                            Watermark::new(
+                                timestamp,
+                                resume_info
+                                    .map(|resume_info| serde_json::to_value(resume_info).unwrap()),
+                            )
+                        })
                         .collect(),
                 );
             }
@@ -167,7 +243,8 @@ struct SnowflakeInputEndpointInner {
     endpoint_name: String,
     config: SnowflakeReaderConfig,
     consumer: Box<dyn InputConsumer>,
-    queue: InputQueue,
+    queue: InputQueue<Option<SnowflakeResumeInfo>>,
+    last_resume_status: Mutex<Option<SnowflakeResumeInfo>>,
 }
 
 impl SnowflakeInputEndpointInner {
@@ -182,6 +259,7 @@ impl SnowflakeInputEndpointInner {
             config,
             consumer,
             queue,
+            last_resume_status: Mutex::new(Some(SnowflakeResumeInfo::initial())),
         }
     }
 
@@ -326,7 +404,7 @@ impl SnowflakeInputEndpointInner {
                 }
             };
 
-            let entry = InputQueueEntry::new_with_aux(timestamp, ())
+            let entry = InputQueueEntry::new_with_aux(timestamp, None)
                 .with_buffer(buffer)
                 .with_start_transaction(transaction_label.clone());
 
@@ -334,14 +412,14 @@ impl SnowflakeInputEndpointInner {
             timestamp = Utc::now();
         }
 
+        let mut completion_entry =
+            InputQueueEntry::new_with_aux(timestamp, Some(SnowflakeResumeInfo::eoi()));
         if transaction_label.is_some() {
-            self.queue.push_entry(
-                InputQueueEntry::new_with_aux(timestamp, ())
-                    .with_start_transaction(transaction_label)
-                    .with_commit_transaction(true),
-                Vec::new(),
-            );
+            completion_entry = completion_entry
+                .with_start_transaction(transaction_label)
+                .with_commit_transaction(true);
         }
+        self.queue.push_entry(completion_entry, Vec::new());
 
         info!(
             "snowflake {}: snapshot load completed (query: '{}')",
@@ -356,7 +434,7 @@ impl SnowflakeInputEndpointInner {
             // Feldera does not currently expose transaction rollback to connectors. Commit any
             // already queued records so a failed connector cannot leave the pipeline blocked.
             self.queue.push_entry(
-                InputQueueEntry::new_with_aux(Utc::now(), ()).with_commit_transaction(true),
+                InputQueueEntry::new_with_aux(Utc::now(), None).with_commit_transaction(true),
                 Vec::new(),
             );
         }
