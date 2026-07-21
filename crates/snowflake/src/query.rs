@@ -9,6 +9,7 @@ use async_stream::try_stream;
 use bytes::BytesMut;
 use feldera_types::{program_schema::Relation, transport::snowflake::SnowflakeNumberMode};
 use futures_util::{stream, stream::BoxStream, StreamExt, TryStreamExt};
+use rand::Rng;
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, CONTENT_ENCODING},
     StatusCode, Url,
@@ -29,6 +30,8 @@ use uuid::Uuid;
 const QUERY_IN_PROGRESS_CODE: &str = "333333";
 const QUERY_IN_PROGRESS_ASYNC_CODE: &str = "333334";
 const CHUNK_DOWNLOAD_MAX_ATTEMPTS: u32 = 6;
+const CHUNK_RETRY_INITIAL_BACKOFF_MS: u64 = 250;
+const CHUNK_RETRY_MAX_BACKOFF_MS: u64 = 8_000;
 const ARROW_DECODE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
 pub(crate) struct SnowflakeArrowQueryMetadata {
@@ -397,7 +400,13 @@ where
 }
 
 fn chunk_retry_backoff(attempt: u32) -> Duration {
-    Duration::from_millis(250 * 2_u64.pow(attempt - 1))
+    let base_delay_ms = CHUNK_RETRY_INITIAL_BACKOFF_MS
+        .checked_shl(attempt.saturating_sub(1))
+        .unwrap_or(u64::MAX)
+        .min(CHUNK_RETRY_MAX_BACKOFF_MS);
+    let jitter_ms = rand::thread_rng().gen_range(0..=(base_delay_ms / 4));
+
+    Duration::from_millis((base_delay_ms + jitter_ms).min(CHUNK_RETRY_MAX_BACKOFF_MS))
 }
 
 fn chunk_headers(data: &QueryData) -> AnyResult<HeaderMap> {
@@ -437,6 +446,7 @@ fn response_is_gzip_encoded(response: &reqwest::Response, url: &str) -> bool {
 
 fn is_retryable_chunk_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::INTERNAL_SERVER_ERROR
         || status == StatusCode::SERVICE_UNAVAILABLE
         || status == StatusCode::BAD_GATEWAY
         || status == StatusCode::GATEWAY_TIMEOUT
@@ -721,5 +731,26 @@ mod tests {
             "https://example.s3.amazonaws.com/chunk"
         );
         assert_eq!(redact_url("not a url"), "<invalid-url>");
+    }
+
+    #[test]
+    fn chunk_retry_uses_bounded_exponential_backoff() {
+        for _ in 0..100 {
+            assert!((250..=312).contains(&chunk_retry_backoff(1).as_millis()));
+            assert!((4_000..=5_000).contains(&chunk_retry_backoff(5).as_millis()));
+            assert_eq!(chunk_retry_backoff(u32::MAX), Duration::from_secs(8));
+        }
+    }
+
+    #[test]
+    fn retries_transient_chunk_statuses() {
+        for status in [429, 500, 502, 503, 504] {
+            assert!(is_retryable_chunk_status(StatusCode::from_u16(status).unwrap()));
+        }
+        for status in [400, 403, 404, 501, 505] {
+            assert!(!is_retryable_chunk_status(
+                StatusCode::from_u16(status).unwrap()
+            ));
+        }
     }
 }
